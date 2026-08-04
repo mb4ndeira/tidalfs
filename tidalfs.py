@@ -11,7 +11,7 @@ from pathlib import Path
 from time import sleep
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
-from mutagen.mp4 import MP4
+from mutagen.mp4 import MP4, MP4Cover
 
 SESSION_FILE = Path.home() / ".config" / "tidalfs" / "session.json"
 BASE_DIRS = ['.', '..']
@@ -185,6 +185,14 @@ def _tag_track(track, track_path):
             tags['\xa9day'] = [str(track.album.year)]
         album_artist = getattr(track.album, 'artist', None)
         tags['aART'] = [album_artist.name if album_artist else track.artist.name]
+        try:
+            cover_url = track.album.image(320)
+            if cover_url:
+                r = requests.get(cover_url, timeout=10)
+                if r.status_code == 200:
+                    tags['covr'] = [MP4Cover(r.content, imageformat=MP4Cover.FORMAT_JPEG)]
+        except Exception:
+            pass
         tags.save()
     except Exception as e:
         logging.warning('tagging failed: %s', e)
