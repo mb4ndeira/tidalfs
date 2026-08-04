@@ -51,7 +51,7 @@ def get_entries_for_path(path, session, root):
         return BASE_DIRS + ['Artist', 'Album', 'Track', 'Favorites']
 
     if path == '/Favorites':
-        return BASE_DIRS + ['Artists', 'Albums', 'Tracks']
+        return BASE_DIRS + ['Albums', 'Tracks']
 
     if path == '/Favorites/Artists':
         dirs = []
