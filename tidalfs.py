@@ -11,6 +11,7 @@ from pathlib import Path
 from time import sleep
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+from mutagen.mp4 import MP4
 
 SESSION_FILE = Path.home() / ".config" / "tidalfs" / "session.json"
 BASE_DIRS = ['.', '..']
@@ -173,6 +174,22 @@ def get_entries_for_path(path, session, root):
     return BASE_DIRS
 
 
+def _tag_track(track, track_path):
+    try:
+        tags = MP4(track_path)
+        tags['\xa9nam'] = [track.name]
+        tags['\xa9ART'] = [track.artist.name]
+        tags['\xa9alb'] = [track.album.name]
+        tags['trkn'] = [(track.track_num or 1, 0)]
+        if hasattr(track.album, 'year') and track.album.year:
+            tags['\xa9day'] = [str(track.album.year)]
+        album_artist = getattr(track.album, 'artist', None)
+        tags['aART'] = [album_artist.name if album_artist else track.artist.name]
+        tags.save()
+    except Exception as e:
+        logging.warning('tagging failed: %s', e)
+
+
 def _download_track(session, track_id, track_path):
     if os.path.exists(track_path):
         return
@@ -185,6 +202,7 @@ def _download_track(session, track_id, track_path):
             with open(track_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
+        _tag_track(track, track_path)
         Path(track_path + '.done').touch()
     except Exception as e:
         logging.error('download failed: %s', e)
