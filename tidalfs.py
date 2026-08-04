@@ -276,4 +276,4 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.WARNING)
 
-    FUSE(Tidal(args.mount), args.mount, foreground=True, nothreads=True)
+    FUSE(Tidal(args.mount), args.mount, foreground=True, nothreads=True, allow_other=True)
