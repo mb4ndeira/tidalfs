@@ -24,7 +24,7 @@ DIRS_CACHE = {}
 LINKS_CACHE = {}
 
 # Limit concurrent Tidal API + download requests to avoid 429s
-DOWNLOAD_SEM = threading.Semaphore(2)
+DOWNLOAD_SEM = threading.Semaphore(1)
 
 
 def _login(session):
@@ -213,16 +213,23 @@ def _download_track(session, track_id, track_path):
         try:
             track = TRACKS_CACHE.get(int(track_id)) or session.track(track_id=track_id)
             TRACKS_CACHE[int(track_id)] = track
-            for attempt in range(5):
+            for attempt in range(8):
                 try:
                     url = track.get_url()
                     break
                 except Exception as e:
-                    if attempt == 4:
+                    if attempt == 7:
                         raise
-                    backoff = 2 ** attempt
-                    logging.warning('get_url retry %d/%d track=%s (%s)', attempt + 1, 5, track_id, e)
-                    sleep(backoff)
+                    # honour Retry-After if present, else exponential backoff
+                    retry_after = None
+                    cause = getattr(e, '__cause__', None)
+                    if cause is not None:
+                        resp = getattr(cause, 'response', None)
+                        if resp is not None:
+                            retry_after = resp.headers.get('Retry-After')
+                    wait = float(retry_after) if retry_after else min(2 ** attempt, 60)
+                    logging.warning('get_url rate-limited, waiting %.0fs (attempt %d) track=%s', wait, attempt + 1, track_id)
+                    sleep(wait)
             with requests.get(url, stream=True) as r:
                 with open(track_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
