@@ -191,8 +191,12 @@ def _tag_track(track, track_path):
 
 
 def _download_track(session, track_id, track_path):
-    if os.path.exists(track_path):
+    done = track_path + '.done'
+    err = track_path + '.error'
+    if os.path.exists(done) or os.path.exists(err):
         return
+    if os.path.exists(track_path):
+        return  # another thread is downloading
     Path(track_path).touch()
     try:
         track = TRACKS_CACHE.get(int(track_id)) or session.track(track_id=track_id)
@@ -203,13 +207,14 @@ def _download_track(session, track_id, track_path):
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
         _tag_track(track, track_path)
-        Path(track_path + '.done').touch()
+        Path(done).touch()
     except Exception as e:
-        logging.error('download failed: %s', e)
+        logging.error('download failed track=%s: %s', track_id, e)
         try:
             os.remove(track_path)
         except OSError:
             pass
+        Path(err).touch()  # unblock any read() waiting on this track
 
 
 class Tidal(LoggingMixIn, Operations):
@@ -254,8 +259,12 @@ class Tidal(LoggingMixIn, Operations):
             args=(self.session, track_id, track_path),
             daemon=True,
         ).start()
-        while not os.path.exists(track_path + '.done'):
+        done = track_path + '.done'
+        err = track_path + '.error'
+        while not os.path.exists(done) and not os.path.exists(err):
             sleep(0.01)
+        if os.path.exists(err):
+            return b''
         with open(track_path, 'rb') as f:
             f.seek(offset)
             return f.read(size)
