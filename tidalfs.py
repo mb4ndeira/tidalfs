@@ -267,9 +267,13 @@ class Tidal(LoggingMixIn, Operations):
         return base
 
     def readdir(self, path, fh):
-        if path not in DIRS_CACHE:
-            DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
-        return DIRS_CACHE[path]
+        try:
+            if path not in DIRS_CACHE:
+                DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
+            return DIRS_CACHE[path]
+        except Exception as e:
+            logging.error('readdir failed %s: %s', path, e)
+            return BASE_DIRS
 
     def readlink(self, path):
         return LINKS_CACHE.get(path, path)
