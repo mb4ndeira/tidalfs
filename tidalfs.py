@@ -254,18 +254,11 @@ class Tidal(LoggingMixIn, Operations):
             args=(self.session, track_id, track_path),
             daemon=True,
         ).start()
-        while not os.path.exists(track_path):
+        while not os.path.exists(track_path + '.done'):
             sleep(0.01)
         with open(track_path, 'rb') as f:
-            done = False
-            data = b''
-            while len(data) < size and not done:
-                sleep(0.01)
-                f.seek(offset)
-                data = f.read(size)
-                if os.path.exists(track_path + '.done'):
-                    done = True
-        return data
+            f.seek(offset)
+            return f.read(size)
 
 
 if __name__ == '__main__':
