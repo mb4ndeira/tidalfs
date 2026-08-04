@@ -23,6 +23,9 @@ ALBUMS_CACHE = {}
 DIRS_CACHE = {}
 LINKS_CACHE = {}
 
+# Limit concurrent Tidal API + download requests to avoid 429s
+DOWNLOAD_SEM = threading.Semaphore(2)
+
 
 def _login(session):
     SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -206,23 +209,33 @@ def _download_track(session, track_id, track_path):
     if os.path.exists(track_path):
         return  # another thread is downloading
     Path(track_path).touch()
-    try:
-        track = TRACKS_CACHE.get(int(track_id)) or session.track(track_id=track_id)
-        TRACKS_CACHE[int(track_id)] = track
-        url = track.get_url()
-        with requests.get(url, stream=True) as r:
-            with open(track_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        _tag_track(track, track_path)
-        Path(done).touch()
-    except Exception as e:
-        logging.error('download failed track=%s: %s', track_id, e)
+    with DOWNLOAD_SEM:
         try:
-            os.remove(track_path)
-        except OSError:
-            pass
-        Path(err).touch()  # unblock any read() waiting on this track
+            track = TRACKS_CACHE.get(int(track_id)) or session.track(track_id=track_id)
+            TRACKS_CACHE[int(track_id)] = track
+            for attempt in range(5):
+                try:
+                    url = track.get_url()
+                    break
+                except Exception as e:
+                    if attempt == 4:
+                        raise
+                    backoff = 2 ** attempt
+                    logging.warning('get_url retry %d/%d track=%s (%s)', attempt + 1, 5, track_id, e)
+                    sleep(backoff)
+            with requests.get(url, stream=True) as r:
+                with open(track_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            _tag_track(track, track_path)
+            Path(done).touch()
+        except Exception as e:
+            logging.error('download failed track=%s: %s', track_id, e)
+            try:
+                os.remove(track_path)
+            except OSError:
+                pass
+            Path(err).touch()  # unblock any read() waiting on this track
 
 
 class Tidal(LoggingMixIn, Operations):
