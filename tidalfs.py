@@ -24,8 +24,8 @@ LINKS_CACHE = {}
 _PREFETCH_STARTED = set()
 _UPGRADING = set()
 _UPGRADING_LOCK = threading.Lock()
-_DIRS_FILL_LOCK = threading.Lock()
-_DIRS_FILLING = {}  # path → threading.Event for in-flight fetches
+_DIRS_BG_LOCK = threading.Lock()
+_DIRS_BG_FETCHING = set()  # paths currently being fetched in background
 
 MIN_FREE_BYTES = 1_500_000_000  # 1.5 GB — stop downloads if disk gets this low
 
@@ -377,11 +377,33 @@ def _prefetch_tracks(session, tracks):
     logging.warning('prefetch done: %d stubs ready', len(tracks))
 
 
+def _prewarm(session, root):
+    """Fetch slow directory listings synchronously before FUSE starts serving requests.
+    This prevents FUSE thread starvation from concurrent blocking API calls on first scan."""
+    paths = ['/Favorites/Albums', '/Favorites/Tracks']
+    threads = []
+    for p in paths:
+        t = threading.Thread(target=lambda path=p: _prewarm_path(path, session, root), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+
+def _prewarm_path(path, session, root):
+    try:
+        DIRS_CACHE[path] = get_entries_for_path(path, session, root)
+        logging.warning('prewarm done: %s (%d entries)', path, len(DIRS_CACHE[path]) - 2)
+    except Exception as e:
+        logging.error('prewarm failed %s: %s', path, e)
+
+
 class Tidal(LoggingMixIn, Operations):
     def __init__(self, root):
         self.root = os.path.abspath(root)
         self.session = tidalapi.Session()
         _login(self.session)
+        _prewarm(self.session, self.root)
 
     def getattr(self, path, fh=None):
         base = {
@@ -405,29 +427,23 @@ class Tidal(LoggingMixIn, Operations):
             base['st_mode'] = stat.S_IFLNK | 0o444
         return base
 
+    def _bg_fetch(self, path):
+        """Fetch directory entries in the background; never blocks a FUSE thread."""
+        try:
+            DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
+        except Exception as e:
+            logging.error('bg_fetch failed %s: %s', path, e)
+        finally:
+            with _DIRS_BG_LOCK:
+                _DIRS_BG_FETCHING.discard(path)
+
     def readdir(self, path, fh):
         try:
             if path not in DIRS_CACHE:
-                _FETCH_ME = object()  # sentinel
-                action = None  # None → already cached; _FETCH_ME → fetch; Event → wait
-                with _DIRS_FILL_LOCK:
-                    if path not in DIRS_CACHE:
-                        if path in _DIRS_FILLING:
-                            action = _DIRS_FILLING[path]
-                        else:
-                            ev = threading.Event()
-                            _DIRS_FILLING[path] = ev
-                            action = _FETCH_ME
-                if action is _FETCH_ME:
-                    try:
-                        DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
-                    finally:
-                        with _DIRS_FILL_LOCK:
-                            ev = _DIRS_FILLING.pop(path, None)
-                        if ev:
-                            ev.set()
-                elif isinstance(action, threading.Event):
-                    action.wait()
+                with _DIRS_BG_LOCK:
+                    if path not in DIRS_CACHE and path not in _DIRS_BG_FETCHING:
+                        _DIRS_BG_FETCHING.add(path)
+                        threading.Thread(target=self._bg_fetch, args=(path,), daemon=True).start()
             for i, name in enumerate(DIRS_CACHE.get(path, BASE_DIRS), 1):
                 yield (name, {}, i)
         except Exception as e:
