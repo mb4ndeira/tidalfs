@@ -293,54 +293,59 @@ def _retry_api(fn, track_id, label):
 def _download_track(session, track_id, track_path):
     done = track_path + '.done'
     err = track_path + '.error'
+    dl_path = track_path + '.dl'  # temp download target — atomic rename on success
+
     if os.path.exists(err):
         return
-    # If done exists and file is real (not a stub), we're already good
+    # Already a real file
     if os.path.exists(done):
         try:
             if os.path.getsize(track_path) >= STUB_SIZE_THRESHOLD:
                 return
         except OSError:
             pass
-    # If another thread is actively downloading (file touched but no done/err yet)
-    if not os.path.exists(done) and os.path.exists(track_path):
+    # Another thread is already downloading this track
+    if os.path.exists(dl_path):
         return
-    if os.path.exists(done):
-        # Must be a stub — remove it so we can download the real file
-        try:
-            os.remove(done)
-        except OSError:
-            pass
-        try:
-            os.remove(track_path)
-        except OSError:
-            pass
-    Path(track_path).touch()
+
     with DOWNLOAD_SEM:
+        # Re-check after acquiring semaphore
+        if os.path.exists(err) or os.path.exists(dl_path):
+            return
+        if os.path.exists(done):
+            try:
+                if os.path.getsize(track_path) >= STUB_SIZE_THRESHOLD:
+                    return
+            except OSError:
+                pass
         try:
             track = TRACKS_CACHE.get(int(track_id))
             if not track:
                 track = _retry_api(lambda: session.track(track_id=track_id), track_id, 'get_track')
                 TRACKS_CACHE[int(track_id)] = track
             url = _retry_api(lambda: track.get_url(), track_id, 'get_url')
+            Path(dl_path).touch()  # signal download in progress
             with requests.get(url, stream=True) as r:
-                with open(track_path, 'wb') as f:
+                with open(dl_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-            _tag_track(track, track_path)
+            _tag_track(track, dl_path)
+            os.rename(dl_path, track_path)  # atomic: stub (or nothing) → real file
             Path(done).touch()
             logging.info('downloaded track=%s', track_id)
         except Exception as e:
             logging.error('download failed track=%s: %s', track_id, e)
             try:
-                os.remove(track_path)
+                os.remove(dl_path)
             except OSError:
                 pass
-            Path(err).touch()
+            # Only mark error if no stub/file to fall back to; otherwise leave stub intact
+            if not (os.path.exists(done) and os.path.exists(track_path)):
+                Path(err).touch()
 
 
 def _upgrade_stub(session, track_id, track_path):
-    """Replace a stub with the real downloaded track (called in background)."""
+    """Replace a stub with the real downloaded track (background)."""
     with _UPGRADING_LOCK:
         if track_id in _UPGRADING:
             return
@@ -445,7 +450,7 @@ class Tidal(LoggingMixIn, Operations):
                     pass
                 # File gone (upgrade in progress) — fall through to wait
 
-        # Not ready — trigger download and wait
+        # Not ready — trigger download and wait for done or error
         threading.Thread(
             target=_download_track,
             args=(self.session, track_id, track_path),
