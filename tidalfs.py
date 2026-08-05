@@ -402,10 +402,12 @@ class Tidal(LoggingMixIn, Operations):
         try:
             if path not in DIRS_CACHE:
                 DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
-            return DIRS_CACHE[path]
+            for i, name in enumerate(DIRS_CACHE[path], 1):
+                yield (name, {}, i)
         except Exception as e:
             logging.error('readdir failed %s: %s', path, e)
-            return BASE_DIRS
+            yield ('.', {}, 1)
+            yield ('..', {}, 2)
 
     def readlink(self, path):
         return LINKS_CACHE.get(path, path)
