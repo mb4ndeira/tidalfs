@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import tidalapi
 import requests
-import tempfile
 import threading
 import os
 import re
@@ -14,14 +13,45 @@ from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 from mutagen.mp4 import MP4, MP4Cover
 
 SESSION_FILE = Path.home() / ".config" / "tidalfs" / "session.json"
+CACHE_PATH = Path("/var/cache/tidalfs")
 BASE_DIRS = ['.', '..']
 ABC = list('ABCDEFGHIJKLMNOPQRSTUVWXYZ')
 
-CACHE_DIR = tempfile.TemporaryDirectory()
 TRACKS_CACHE = {}
 ALBUMS_CACHE = {}
 DIRS_CACHE = {}
 LINKS_CACHE = {}
+_PREFETCH_STARTED = set()
+_UPGRADING = set()
+_UPGRADING_LOCK = threading.Lock()
+
+# 0.05-second AAC silence — used as stub base for fast metadata scanning
+SILENCE_M4A_BYTES = bytes.fromhex(
+    '0000001c667479704d344120000002004d34412069736f6d69736f3200000008667265650000'
+    '00296d646174de02004c61766336322e31312e313030000230400e0118200701182007011820'
+    '070000030a6d6f6f760000006c6d766864000000000000000000000000000003e80000003200'
+    '0100000100000000000000000000000001000000000000000000000000000000010000000000'
+    '0000000000000000004000000000000000000000000000000000000000000000000000000000'
+    '000002000002357472616b0000005c746b686400000003000000000000000000000001000000'
+    '0000000032000000000000000000000001010000000001000000000000000000000000000000'
+    '0100000000000000000000000000004000000000000000000000000000002465647473000000'
+    '1c656c73740000000000000001000000320000040000010000000001ad6d646961000000206d'
+    '6468640000000000000000000000000000ac4400000c9d55c400000000002d68646c72000000'
+    '0000000000736f756e000000000000000000000000536f756e6448616e646c65720000000158'
+    '6d696e6600000010736d686400000000000000000000002464696e660000001c647265660000'
+    '0000000000010000000c75726c20000000010000011c7374626c0000006a7374736400000000'
+    '000000010000005a6d703461000000000000000100000000000000000001001000000000ac44'
+    '0000000000366573647300000000038080802500010004808080174015000000000177000000'
+    '0e150580808005120856e5000680808001020000002073747473000000000000000200000003'
+    '00000400000000010000009d0000001c73747363000000000000000100000001000000040000'
+    '0001000000247374737a00000000000000000000000400000015000000040000000400000004'
+    '000000147374636f00000000000000010000002c0000001a7367706401000000726f6c6c0000'
+    '000200000001ffff0000001c7362677000000000726f6c6c0000000100000004000000010000'
+    '006175647461000000596d657461000000000000002168646c7200000000000000006d646972'
+    '6170706c0000000000000000000000002c696c737400000024a9746f6f0000001c6461746100'
+    '000001000000004c61766636322e332e313030'
+)
+STUB_SIZE_THRESHOLD = 50_000  # bytes — stubs are ~3-5KB, real tracks are several MB
 
 # Limit concurrent Tidal API + download requests to avoid 429s
 DOWNLOAD_SEM = threading.Semaphore(1)
@@ -78,6 +108,7 @@ def get_entries_for_path(path, session, root):
         return BASE_DIRS + dirs
 
     if path == '/Favorites/Tracks':
+        all_tracks = []
         files = []
         offset = 0
         while True:
@@ -86,11 +117,16 @@ def get_entries_for_path(path, session, root):
                 break
             for track in batch:
                 name = f"{track.name.replace('/', '-')} ({track.artist.name}).m4a"
+                TRACKS_CACHE[track.id] = track
                 LINKS_CACHE[f'{path}/{name}'] = f'{root}/.tracks/{track.id}.m4a'
                 files.append(name)
+                all_tracks.append(track)
             if len(batch) < 500:
                 break
             offset += 500
+        if path not in _PREFETCH_STARTED:
+            _PREFETCH_STARTED.add(path)
+            threading.Thread(target=_prefetch_tracks, args=(session, all_tracks), daemon=True).start()
         return BASE_DIRS + files
 
     if path in ('/Artist', '/Album', '/Track'):
@@ -217,48 +253,116 @@ def _tag_track(track, track_path):
         logging.warning('tagging failed: %s', e)
 
 
+def _create_stub(track, track_path):
+    """Write a tiny tagged M4A stub so scanners can extract metadata without downloading."""
+    done = track_path + '.done'
+    if os.path.exists(done):
+        return
+    try:
+        with open(track_path, 'wb') as f:
+            f.write(SILENCE_M4A_BYTES)
+        _tag_track(track, track_path)
+        Path(done).touch()
+        logging.info('stub created track=%s', track.id)
+    except Exception as e:
+        logging.warning('stub creation failed track=%s: %s', track.id, e)
+        try:
+            os.remove(track_path)
+        except OSError:
+            pass
+
+
+def _retry_api(fn, track_id, label):
+    for attempt in range(8):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == 7:
+                raise
+            retry_after = None
+            cause = getattr(e, '__cause__', None)
+            if cause is not None:
+                resp = getattr(cause, 'response', None)
+                if resp is not None:
+                    retry_after = resp.headers.get('Retry-After')
+            wait = float(retry_after) if retry_after else min(2 ** attempt, 60)
+            logging.warning('%s rate-limited, waiting %.0fs (attempt %d) track=%s', label, wait, attempt + 1, track_id)
+            sleep(wait)
+
+
 def _download_track(session, track_id, track_path):
     done = track_path + '.done'
     err = track_path + '.error'
-    if os.path.exists(done) or os.path.exists(err):
+    if os.path.exists(err):
         return
-    if os.path.exists(track_path):
-        return  # another thread is downloading
+    # If done exists and file is real (not a stub), we're already good
+    if os.path.exists(done):
+        try:
+            if os.path.getsize(track_path) >= STUB_SIZE_THRESHOLD:
+                return
+        except OSError:
+            pass
+    # If another thread is actively downloading (file touched but no done/err yet)
+    if not os.path.exists(done) and os.path.exists(track_path):
+        return
+    if os.path.exists(done):
+        # Must be a stub — remove it so we can download the real file
+        try:
+            os.remove(done)
+        except OSError:
+            pass
+        try:
+            os.remove(track_path)
+        except OSError:
+            pass
     Path(track_path).touch()
     with DOWNLOAD_SEM:
         try:
-            track = TRACKS_CACHE.get(int(track_id)) or session.track(track_id=track_id)
-            TRACKS_CACHE[int(track_id)] = track
-            for attempt in range(8):
-                try:
-                    url = track.get_url()
-                    break
-                except Exception as e:
-                    if attempt == 7:
-                        raise
-                    # honour Retry-After if present, else exponential backoff
-                    retry_after = None
-                    cause = getattr(e, '__cause__', None)
-                    if cause is not None:
-                        resp = getattr(cause, 'response', None)
-                        if resp is not None:
-                            retry_after = resp.headers.get('Retry-After')
-                    wait = float(retry_after) if retry_after else min(2 ** attempt, 60)
-                    logging.warning('get_url rate-limited, waiting %.0fs (attempt %d) track=%s', wait, attempt + 1, track_id)
-                    sleep(wait)
+            track = TRACKS_CACHE.get(int(track_id))
+            if not track:
+                track = _retry_api(lambda: session.track(track_id=track_id), track_id, 'get_track')
+                TRACKS_CACHE[int(track_id)] = track
+            url = _retry_api(lambda: track.get_url(), track_id, 'get_url')
             with requests.get(url, stream=True) as r:
                 with open(track_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
             _tag_track(track, track_path)
             Path(done).touch()
+            logging.info('downloaded track=%s', track_id)
         except Exception as e:
             logging.error('download failed track=%s: %s', track_id, e)
             try:
                 os.remove(track_path)
             except OSError:
                 pass
-            Path(err).touch()  # unblock any read() waiting on this track
+            Path(err).touch()
+
+
+def _upgrade_stub(session, track_id, track_path):
+    """Replace a stub with the real downloaded track (called in background)."""
+    with _UPGRADING_LOCK:
+        if track_id in _UPGRADING:
+            return
+        _UPGRADING.add(track_id)
+    try:
+        _download_track(session, track_id, track_path)
+    finally:
+        with _UPGRADING_LOCK:
+            _UPGRADING.discard(track_id)
+
+
+def _prefetch_tracks(session, tracks):
+    # Phase 1: create stubs for all tracks quickly (enables fast metadata scanning)
+    for track in tracks:
+        track_path = str(CACHE_PATH / f'{track.id}.m4a')
+        _create_stub(track, track_path)
+    logging.warning('prefetch phase 1 done: %d stubs created', len(tracks))
+    # Phase 2: replace stubs with real downloads (sequential, rate-limited)
+    for track in tracks:
+        track_path = str(CACHE_PATH / f'{track.id}.m4a')
+        _upgrade_stub(session, str(track.id), track_path)
+    logging.warning('prefetch phase 2 done: %d tracks downloaded', len(tracks))
 
 
 class Tidal(LoggingMixIn, Operations):
@@ -275,7 +379,14 @@ class Tidal(LoggingMixIn, Operations):
         if path.endswith('.m4a'):
             if path.startswith('/.tracks/'):
                 base['st_mode'] = stat.S_IFREG | 0o444
-                base['st_size'] = 50_000_000
+                track_path = str(CACHE_PATH / path.split('/')[-1])
+                if os.path.exists(track_path):
+                    try:
+                        base['st_size'] = os.path.getsize(track_path)
+                    except OSError:
+                        base['st_size'] = 50_000_000
+                else:
+                    base['st_size'] = 50_000_000
             else:
                 base['st_mode'] = stat.S_IFLNK | 0o444
         elif path in LINKS_CACHE or '/Search/' in path:
@@ -301,14 +412,45 @@ class Tidal(LoggingMixIn, Operations):
         if filename.startswith('._'):
             return b''
         track_id = filename[:-4]
-        track_path = os.path.join(CACHE_DIR.name, f'{track_id}.m4a')
+        track_path = str(CACHE_PATH / f'{track_id}.m4a')
+        done = track_path + '.done'
+        err = track_path + '.error'
+
+        # If file is ready, serve it
+        if os.path.exists(done) and not os.path.exists(err):
+            try:
+                file_size = os.path.getsize(track_path)
+            except OSError:
+                file_size = 0
+            if file_size >= STUB_SIZE_THRESHOLD:
+                # Real file — serve immediately
+                with open(track_path, 'rb') as f:
+                    f.seek(offset)
+                    return f.read(size)
+            elif file_size > 0:
+                # Stub — serve immediately and trigger upgrade in background
+                with _UPGRADING_LOCK:
+                    is_upgrading = track_id in _UPGRADING
+                if not is_upgrading:
+                    threading.Thread(
+                        target=_upgrade_stub,
+                        args=(self.session, track_id, track_path),
+                        daemon=True,
+                    ).start()
+                try:
+                    with open(track_path, 'rb') as f:
+                        f.seek(offset)
+                        return f.read(size)
+                except OSError:
+                    pass
+                # File gone (upgrade in progress) — fall through to wait
+
+        # Not ready — trigger download and wait
         threading.Thread(
             target=_download_track,
             args=(self.session, track_id, track_path),
             daemon=True,
         ).start()
-        done = track_path + '.done'
-        err = track_path + '.error'
         while not os.path.exists(done) and not os.path.exists(err):
             sleep(0.01)
         if os.path.exists(err):
@@ -325,5 +467,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING)
+    CACHE_PATH.mkdir(parents=True, exist_ok=True)
 
     FUSE(Tidal(args.mount), args.mount, foreground=True, nothreads=False, allow_other=True)
