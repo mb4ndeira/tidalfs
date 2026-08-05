@@ -458,6 +458,12 @@ class Tidal(LoggingMixIn, Operations):
             yield ('.', {}, 1)
             yield ('..', {}, 2)
 
+    def getxattr(self, path, name, position=0):
+        return b''
+
+    def listxattr(self, path):
+        return []
+
     def readlink(self, path):
         return LINKS_CACHE.get(path, path)
 
