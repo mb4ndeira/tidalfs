@@ -378,11 +378,18 @@ def _prefetch_tracks(session, tracks):
 
 
 def _prewarm(session, root):
-    """Fetch slow directory listings synchronously before FUSE starts serving requests.
-    This prevents FUSE thread starvation from concurrent blocking API calls on first scan."""
-    paths = ['/Favorites/Albums', '/Favorites/Tracks']
+    """Populate DIRS_CACHE before FUSE starts serving requests.
+    Fast paths (no API calls) are done synchronously; slow API paths run in parallel."""
+    # Fast paths: instant, no API calls — must be ready before FUSE serves any request
+    for p in ['/', '/Favorites']:
+        try:
+            DIRS_CACHE[p] = get_entries_for_path(p, session, root)
+        except Exception as e:
+            logging.error('prewarm fast path failed %s: %s', p, e)
+    # Slow paths: run in parallel, FUSE starts serving after both finish
+    slow_paths = ['/Favorites/Albums', '/Favorites/Tracks']
     threads = []
-    for p in paths:
+    for p in slow_paths:
         t = threading.Thread(target=lambda path=p: _prewarm_path(path, session, root), daemon=True)
         t.start()
         threads.append(t)
