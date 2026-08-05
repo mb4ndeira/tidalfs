@@ -24,6 +24,10 @@ LINKS_CACHE = {}
 _PREFETCH_STARTED = set()
 _UPGRADING = set()
 _UPGRADING_LOCK = threading.Lock()
+_DIRS_FILL_LOCK = threading.Lock()
+_DIRS_FILLING = {}  # path → threading.Event for in-flight fetches
+
+MIN_FREE_BYTES = 1_500_000_000  # 1.5 GB — stop downloads if disk gets this low
 
 # 0.05-second AAC silence — used as stub base for fast metadata scanning
 SILENCE_M4A_BYTES = bytes.fromhex(
@@ -318,6 +322,9 @@ def _download_track(session, track_id, track_path):
                     return
             except OSError:
                 pass
+        if not _has_disk_space():
+            logging.warning('low disk space, skipping download track=%s', track_id)
+            return
         try:
             track = TRACKS_CACHE.get(int(track_id))
             if not track:
@@ -357,17 +364,17 @@ def _upgrade_stub(session, track_id, track_path):
             _UPGRADING.discard(track_id)
 
 
+def _has_disk_space():
+    st = os.statvfs(str(CACHE_PATH))
+    return st.f_bavail * st.f_frsize >= MIN_FREE_BYTES
+
+
 def _prefetch_tracks(session, tracks):
-    # Phase 1: create stubs for all tracks quickly (enables fast metadata scanning)
+    # Only create stubs (tiny tagged M4A files). Real downloads happen lazily on playback.
     for track in tracks:
         track_path = str(CACHE_PATH / f'{track.id}.m4a')
         _create_stub(track, track_path)
-    logging.warning('prefetch phase 1 done: %d stubs created', len(tracks))
-    # Phase 2: replace stubs with real downloads (sequential, rate-limited)
-    for track in tracks:
-        track_path = str(CACHE_PATH / f'{track.id}.m4a')
-        _upgrade_stub(session, str(track.id), track_path)
-    logging.warning('prefetch phase 2 done: %d tracks downloaded', len(tracks))
+    logging.warning('prefetch done: %d stubs ready', len(tracks))
 
 
 class Tidal(LoggingMixIn, Operations):
@@ -401,8 +408,26 @@ class Tidal(LoggingMixIn, Operations):
     def readdir(self, path, fh):
         try:
             if path not in DIRS_CACHE:
-                DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
-            for i, name in enumerate(DIRS_CACHE[path], 1):
+                # Dedup concurrent fetches: only one thread fetches per path
+                with _DIRS_FILL_LOCK:
+                    if path not in DIRS_CACHE:
+                        if path in _DIRS_FILLING:
+                            event = _DIRS_FILLING[path]
+                        else:
+                            event = threading.Event()
+                            _DIRS_FILLING[path] = event
+                            event = None  # this thread owns the fetch
+                if event is None:
+                    try:
+                        DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
+                    finally:
+                        with _DIRS_FILL_LOCK:
+                            ev = _DIRS_FILLING.pop(path, None)
+                        if ev:
+                            ev.set()
+                else:
+                    event.wait()
+            for i, name in enumerate(DIRS_CACHE.get(path, BASE_DIRS), 1):
                 yield (name, {}, i)
         except Exception as e:
             logging.error('readdir failed %s: %s', path, e)
