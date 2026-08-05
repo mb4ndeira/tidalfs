@@ -63,18 +63,34 @@ def get_entries_for_path(path, session, root):
 
     if path == '/Favorites/Albums':
         dirs = []
-        for album in _favorites(session).albums():
-            name = album.name.replace('/', '-')
-            LINKS_CACHE[f'{path}/{name}'] = f'{root}/.albums/{album.id}'
-            dirs.append(name)
+        offset = 0
+        while True:
+            batch = _favorites(session).albums(limit=500, offset=offset)
+            if not batch:
+                break
+            for album in batch:
+                name = album.name.replace('/', '-')
+                LINKS_CACHE[f'{path}/{name}'] = f'{root}/.albums/{album.id}'
+                dirs.append(name)
+            if len(batch) < 500:
+                break
+            offset += 500
         return BASE_DIRS + dirs
 
     if path == '/Favorites/Tracks':
         files = []
-        for track in _favorites(session).tracks():
-            name = f"{track.name.replace('/', '-')} ({track.artist.name}).m4a"
-            LINKS_CACHE[f'{path}/{name}'] = f'{root}/.tracks/{track.id}.m4a'
-            files.append(name)
+        offset = 0
+        while True:
+            batch = _favorites(session).tracks(limit=500, offset=offset)
+            if not batch:
+                break
+            for track in batch:
+                name = f"{track.name.replace('/', '-')} ({track.artist.name}).m4a"
+                LINKS_CACHE[f'{path}/{name}'] = f'{root}/.tracks/{track.id}.m4a'
+                files.append(name)
+            if len(batch) < 500:
+                break
+            offset += 500
         return BASE_DIRS + files
 
     if path in ('/Artist', '/Album', '/Track'):
