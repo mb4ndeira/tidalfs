@@ -408,16 +408,17 @@ class Tidal(LoggingMixIn, Operations):
     def readdir(self, path, fh):
         try:
             if path not in DIRS_CACHE:
-                # Dedup concurrent fetches: only one thread fetches per path
+                _FETCH_ME = object()  # sentinel
+                action = None  # None → already cached; _FETCH_ME → fetch; Event → wait
                 with _DIRS_FILL_LOCK:
                     if path not in DIRS_CACHE:
                         if path in _DIRS_FILLING:
-                            event = _DIRS_FILLING[path]
+                            action = _DIRS_FILLING[path]
                         else:
-                            event = threading.Event()
-                            _DIRS_FILLING[path] = event
-                            event = None  # this thread owns the fetch
-                if event is None:
+                            ev = threading.Event()
+                            _DIRS_FILLING[path] = ev
+                            action = _FETCH_ME
+                if action is _FETCH_ME:
                     try:
                         DIRS_CACHE[path] = get_entries_for_path(path, self.session, self.root)
                     finally:
@@ -425,8 +426,8 @@ class Tidal(LoggingMixIn, Operations):
                             ev = _DIRS_FILLING.pop(path, None)
                         if ev:
                             ev.set()
-                else:
-                    event.wait()
+                elif isinstance(action, threading.Event):
+                    action.wait()
             for i, name in enumerate(DIRS_CACHE.get(path, BASE_DIRS), 1):
                 yield (name, {}, i)
         except Exception as e:
