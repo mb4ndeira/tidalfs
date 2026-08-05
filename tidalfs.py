@@ -492,6 +492,21 @@ class Tidal(LoggingMixIn, Operations):
             return f.read(size)
 
 
+def _startup_cleanup():
+    """Remove orphaned .dl temp files and stale .error markers left by a crash."""
+    for f in CACHE_PATH.glob('*.dl'):
+        try:
+            f.unlink()
+            logging.warning('removed orphaned temp: %s', f.name)
+        except OSError:
+            pass
+    for f in CACHE_PATH.glob('*.error'):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Mount Tidal as a local filesystem')
@@ -500,5 +515,6 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.WARNING)
     CACHE_PATH.mkdir(parents=True, exist_ok=True)
+    _startup_cleanup()
 
     FUSE(Tidal(args.mount), args.mount, foreground=True, nothreads=False, allow_other=True)
